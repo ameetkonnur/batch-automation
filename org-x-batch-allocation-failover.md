@@ -1,7 +1,7 @@
-# AGEAS Azure Batch Allocation Failover Automation (AZ CLI)
+# Organization X Azure Batch Allocation Failover Automation (AZ CLI)
 
 ## What problem this solves (and how)
-AGEAS/AG Insurance HPC runs can fail **even when quota exists** because **capacity isn’t available at allocation time**. When that happens, Azure Batch pools can get stuck in resize/allocation failures and the run requires manual intervention.
+Organization X HPC runs can fail **even when quota exists** because **capacity isn't available at allocation time**. When that happens, Azure Batch pools can get stuck in resize/allocation failures and the run requires manual intervention.
 
 This document implements a **simple, reliable multi-pool failover** pattern:
 
@@ -20,7 +20,7 @@ Two pools in the same Batch account:
   - (optionally) re-queue jobs / ensure job-level pool selection for the rerun
 - Send notification to Teams/email.
 
-This matches the “multi-pool + automation” approach mentioned in the AGEAS discussions.
+This matches the "multi-pool + automation" approach mentioned in the Organization X discussions.
 
 ---
 
@@ -97,7 +97,7 @@ CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-60}
 PRIMARY_TARGET_NODES=${PRIMARY_TARGET_NODES:-0}
 FALLBACK_TARGET_NODES=${FALLBACK_TARGET_NODES:-50}
 
-STATE_DIR=${STATE_DIR:-"/tmp/ageas-batch-failover"}
+STATE_DIR=${STATE_DIR:-"/tmp/org-x-batch-failover"}
 STATE_FILE="$STATE_DIR/state.env"
 mkdir -p "$STATE_DIR"
 
@@ -163,7 +163,7 @@ notify() {
   if [[ -n "${WEBHOOK_URL:-}" ]]; then
     curl -sS -X POST "$WEBHOOK_URL" \
       -H "Content-Type: application/json" \
-      -d "{\"title\":\"AGEAS Batch Failover\",\"message\":\"$message\"}" >/dev/null || true
+      -d "{\"title\":\"Organization X Batch Failover\",\"message\":\"$message\"}" >/dev/null || true
   fi
 }
 
@@ -275,10 +275,10 @@ set -euo pipefail
 : "${PRIMARY_POOL:?}"
 : "${FALLBACK_POOL:?}"
 
-JOB_PREFIX=${JOB_PREFIX:-"ageas-run"}
+JOB_PREFIX=${JOB_PREFIX:-"org-x-run"}
 TASKS_JSON=${TASKS_JSON:-"tasks.json"}
 
-STATE_DIR=${STATE_DIR:-"/tmp/ageas-batch-failover"}
+STATE_DIR=${STATE_DIR:-"/tmp/org-x-batch-failover"}
 STATE_FILE="$STATE_DIR/state.env"
 
 az account set --subscription "$SUBSCRIPTION_ID" >/dev/null
@@ -353,7 +353,7 @@ $rule = $payload.data.essentials.alertRule
 Write-Output "AlertId=$alertId Severity=$severity Rule=$rule"
 
 # Hybrid Worker example: call controller once
-$cmd = "/bin/bash /opt/ageas/failover-controller.sh --once"
+$cmd = "/bin/bash /opt/org-x/failover-controller.sh --once"
 Write-Output "Executing: $cmd"
 
 bash -c $cmd

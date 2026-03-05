@@ -19,7 +19,7 @@ $rule = $payload.data.essentials.alertRule
 Write-Output "AlertId=$alertId Severity=$severity Rule=$rule"
 
 # Hybrid Worker example: call controller once
-$cmd = "/bin/bash /opt/ageas/failover-controller.sh --once"
+$cmd = "/bin/bash /opt/org-x/failover-controller.sh --once"
 Write-Output "Executing: $cmd"
 
 bash -c $cmd

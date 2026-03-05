@@ -14,7 +14,7 @@ CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-60}
 PRIMARY_TARGET_NODES=${PRIMARY_TARGET_NODES:-0}
 FALLBACK_TARGET_NODES=${FALLBACK_TARGET_NODES:-50}
 
-STATE_DIR=${STATE_DIR:-"/tmp/ageas-batch-failover"}
+STATE_DIR=${STATE_DIR:-"/tmp/org-x-batch-failover"}
 STATE_FILE="$STATE_DIR/state.env"
 mkdir -p "$STATE_DIR"
 
@@ -80,7 +80,7 @@ notify() {
   if [[ -n "${WEBHOOK_URL:-}" ]]; then
     curl -sS -X POST "$WEBHOOK_URL" \
       -H "Content-Type: application/json" \
-      -d "{\"title\":\"AGEAS Batch Failover\",\"message\":\"$message\"}" >/dev/null || true
+      -d "{\"title\":\"Organization X Batch Failover\",\"message\":\"$message\"}" >/dev/null || true
   fi
 }
 

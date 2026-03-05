@@ -7,10 +7,10 @@ set -euo pipefail
 : "${PRIMARY_POOL:?}"
 : "${FALLBACK_POOL:?}"
 
-JOB_PREFIX=${JOB_PREFIX:-"ageas-run"}
+JOB_PREFIX=${JOB_PREFIX:-"org-x-run"}
 TASKS_JSON=${TASKS_JSON:-"tasks.json"}
 
-STATE_DIR=${STATE_DIR:-"/tmp/ageas-batch-failover"}
+STATE_DIR=${STATE_DIR:-"/tmp/org-x-batch-failover"}
 STATE_FILE="$STATE_DIR/state.env"
 
 az account set --subscription "$SUBSCRIPTION_ID" >/dev/null
