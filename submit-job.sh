@@ -6,20 +6,18 @@
 # Modes:
 #   submit          Submit a job and exit (default)
 #   submit --wait   Submit and wait for alert-triggered failover (up to MAX_WAIT_MINUTES)
-#   submit --manual Submit and call webhook directly to trigger failover
 #
 # Usage:
 #   ./submit-job.sh                           # submit only
 #   ./submit-job.sh --wait                    # submit + wait for real alert
-#   ./submit-job.sh --manual                  # submit + call webhook directly
-#   COMMAND="python train.py" ./submit-job.sh # custom task command
+#   COMMAND="/bin/bash -c 'my-script.sh'" ./submit-job.sh  # custom task command
 #
 # Config (override via env vars):
 #   BATCH_ACCOUNT_NAME  — default: batchaccountameetk
 #   RESOURCE_GROUP      — default: batch
 #   PRIMARY_POOL        — the primary pool to submit to
 #   FALLBACK_POOL       — the backup pool (for verification only)
-#   WEBHOOK_URL         — the Container App webhook endpoint
+#   WEBHOOK_URL         — the Container App webhook endpoint (used in docs only)
 #   JOB_PREFIX          — job name prefix (default: batch-run)
 #   COMMAND             — task command (default: echo hello)
 #   MAX_WAIT_MINUTES    — how long to wait for failover (default: 15)
@@ -30,7 +28,6 @@ BATCH_ACCOUNT_NAME="${BATCH_ACCOUNT_NAME:-batchaccountameetk}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-batch}"
 PRIMARY_POOL="${PRIMARY_POOL:-pool-hbv4-err-20260317T091514Z}"
 FALLBACK_POOL="${FALLBACK_POOL:-pool-ev3-swedencentral-20260317T091042Z}"
-WEBHOOK_URL="${WEBHOOK_URL:-https://batch-failover-api.jollyocean-1d29d8d9.eastus.azurecontainerapps.io/api/batch/allocation-alert}"
 JOB_PREFIX="${JOB_PREFIX:-batch-run}"
 COMMAND="${COMMAND:-/bin/bash -c 'echo hello from batch job'}"
 MAX_WAIT_MINUTES="${MAX_WAIT_MINUTES:-15}"
@@ -102,38 +99,7 @@ if [[ "$MODE" == "submit" ]]; then
   exit 0
 fi
 
-if [[ "$MODE" == "--manual" ]]; then
-  echo "[4/4] Calling webhook to trigger failover..."
-  RESPONSE=$(curl -s -w "\n%{http_code}" \
-    -X POST "$WEBHOOK_URL" \
-    -H "Content-Type: application/json" \
-    -d '{
-    "schemaId": "azureMonitorCommonAlertSchema",
-    "data": {
-      "essentials": {
-        "alertRule": "manual-test",
-        "severity": "Sev1",
-        "monitorCondition": "Fired",
-        "firedDateTime": "'"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"'"
-      },
-      "alertContext": {
-        "conditionType": "SingleResourceMultipleMetricCriteria",
-        "condition": {
-          "allOf": [{
-            "metricName": "CreatingNodeCount",
-            "dimensions": [{"name": "poolId", "value": "'"$PRIMARY_POOL"'"}]
-          }]
-        }
-      }
-    }
-  }')
-
-  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-  BODY=$(echo "$RESPONSE" | head -n -1)
-  echo "  HTTP: $HTTP_CODE"
-  echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
-
-elif [[ "$MODE" == "--wait" ]]; then
+if [[ "$MODE" == "--wait" ]]; then
   echo "[4/4] Waiting for Azure Monitor alert to fire (max ${MAX_WAIT_MINUTES} min)..."
   echo "  Autoscale will attempt allocation → fail → ServiceLog → alert → webhook → failover"
   echo ""
