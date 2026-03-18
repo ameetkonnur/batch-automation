@@ -1,380 +1,216 @@
-# Organization X Azure Batch Allocation Failover Automation (AZ CLI)
+# Azure Batch Allocation Failover Automation
 
-## What problem this solves (and how)
-Organization X HPC runs can fail **even when quota exists** because **capacity isn't available at allocation time**. When that happens, Azure Batch pools can get stuck in resize/allocation failures and the run requires manual intervention.
+## Problem
 
-This document implements a **simple, reliable multi-pool failover** pattern:
+Azure Batch pool allocations can fail even when quota exists — capacity may not be available at allocation time. When autoscale triggers or a manual resize requests nodes, the pool can end up with `resizeErrors` (e.g. `AccountVMSeriesCoreQuotaReached`) and zero running nodes. Jobs submitted to that pool are stuck and require manual intervention.
 
-**Architecture (simple + reliable)**
-Two pools in the same Batch account:
+## Solution
 
-- `pool-hbv4` (primary)
-- `pool-edsv5` (fallback)
+An automated failover system that detects pool allocation failures via Azure Monitor and moves active jobs from the failing primary pool to a healthy backup pool.
 
-**Automation loop**
+```
+Pool resize fails
+  → Batch writes PoolResizeCompleteEvent (Failure) to ServiceLog
+  → ServiceLog ingested into Log Analytics (~2-5 min)
+  → Scheduled Query Rule alert evaluates every 5 min (10 min window)
+  → Alert fires → Action Group → Webhook
+  → .NET API (Container App) receives alert
+  → API checks POOL_MAP: only primary pools are evaluated (backup pools are never failed over)
+  → API detects resize errors on primary pool
+  → Active jobs are moved: disable → update pool → re-enable
+  → Jobs run on backup pool
+```
 
-- Monitor for allocation failure signals (pool resize failing / nodes unusable / no nodes coming online)
-- If failure condition persists for **N minutes**:
-  - scale down primary pool
-  - scale up fallback pool
-  - (optionally) re-queue jobs / ensure job-level pool selection for the rerun
-- Send notification to Teams/email.
+## Architecture
 
-This matches the "multi-pool + automation" approach mentioned in the Organization X discussions.
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────────┐
+│  Batch Account  │────→│  Log Analytics    │────→│  Scheduled Query    │
+│  (ServiceLog)   │     │  (AzureDiag)      │     │  Rule Alert         │
+└─────────────────┘     └──────────────────┘     └────────┬────────────┘
+                                                          │ fires
+                                                          ▼
+                                                 ┌─────────────────────┐
+                                                 │  Action Group       │
+                                                 │  (Webhook)          │
+                                                 └────────┬────────────┘
+                                                          │ calls
+                                                          ▼
+                                                 ┌─────────────────────┐
+                                                 │  Container App      │
+                                                 │  (.NET Failover API)│
+                                                 └────────┬────────────┘
+                                                          │ moves jobs
+                                                          ▼
+                                                 ┌─────────────────────┐
+                                                 │  Batch Account      │
+                                                 │  (job → backup pool)│
+                                                 └─────────────────────┘
+```
 
----
+## Files
 
-## Key constraints (don’t skip)
-- This automation **does not guarantee capacity** and **does not reserve HBv4**.
-- It **does not enable checkpointing**; interrupted workloads must be restarted.
+| File | Purpose |
+|------|---------|
+| `api/` | .NET 8 ASP.NET Core API deployed as a Container App. Receives alert webhooks and performs job failover. |
+| `api/Program.cs` | Webhook endpoint. Handles both metric-based alerts (poolId in dimensions) and log-based alerts (scans all primary pools). |
+| `api/Services/BatchService.cs` | Core failover logic. Parses `POOL_MAP`, detects resize errors, moves jobs between pools. |
+| `api/Models/AlertPayload.cs` | Azure Monitor Common Alert Schema model. |
+| `api/Dockerfile` | Container image build for the API. |
+| `setup-log-based-alert.sh` | Creates diagnostic settings, Log Analytics workspace config, and Scheduled Query Rule alert. |
+| `test-failover-e2e.sh` | End-to-end test script. `--wait` mode waits for real alert; `--manual` mode calls webhook directly. |
+| `submit-job-with-metadata.sh` | Job submission utility with metadata for traceability. |
 
----
+## Configuration
 
-## Components delivered in this package
-- `failover-controller.sh` – health check + persistence window + cooldown + failover
-- `submit-job-with-metadata.sh` – job submission helper that adds metadata for traceability
-- `runbook-HandleBatchAllocationAlert.ps1` – Azure Automation runbook (Common Alert Schema webhook) that can call the controller
+### POOL_MAP (Environment Variable on Container App)
 
----
+Maps primary pools to their backup pools. Format:
+
+```
+POOL_MAP="primary1:backup1:maxNodes,primary2:backup2:maxNodes,..."
+```
+
+Example:
+```
+POOL_MAP="pool-hbv4:pool-ev3:2,pool-nc:pool-nv:10"
+```
+
+- **Primary pools** (keys) — monitored for failures, jobs are moved FROM these
+- **Backup pools** (values) — jobs are moved TO these, never failed over themselves
+- **maxNodes** — maximum dedicated nodes for utilization-based failover (optional, default 100)
+
+### Other Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BATCH_ACCOUNT_URL` | required | Batch account endpoint (e.g. `https://myaccount.eastus.batch.azure.com`) |
+| `POOL_MAP` | required | Primary-to-backup pool mapping (see above) |
+| `FAILOVER_THRESHOLD_PERCENT` | `80` | Utilization threshold for capacity-based failover. Set to `0` to skip utilization check and failover on any resize error. |
+
+### Alert Configuration
+
+Set via `setup-log-based-alert.sh`:
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| Evaluation frequency | 5 min | How often the KQL query runs |
+| Window size | 10 min | How far back the query looks for failure events |
+| Auto-mitigate | false | Alert fires every cycle while failures exist |
+| Severity | Sev1 | High severity |
+
+### KQL Alert Query
+
+Pool-agnostic — fires for any pool with resize failures. The API determines which pools are primary vs backup.
+
+```kql
+AzureDiagnostics
+| where ResourceProvider == "MICROSOFT.BATCH"
+| where Category == "ServiceLog"
+| where OperationName == "PoolResizeCompleteEvent"
+| where resultCode_s == "Failure"
+| project TimeGenerated, poolId=id_s, resultCode_s, targetDedicatedNodes_d, currentDedicatedNodes_d
+| summarize ErrorCount=count(), arg_max(TimeGenerated, *) by poolId
+```
+
+## Failover Logic
+
+The API handles two alert types:
+
+### Metric-based alerts (poolId in dimensions)
+1. Extract `poolId` from `alertContext.condition.allOf[].dimensions`
+2. Check if poolId is a primary pool (in `POOL_MAP` keys) — skip if it's a backup
+3. Query pool status via Batch API
+4. If resize errors detected: find active jobs on that pool and move them
+
+### Log-based alerts (no poolId in dimensions)
+1. Scan ALL primary pools in `POOL_MAP`
+2. For each primary pool: query status, check for resize errors
+3. Move active jobs from any failing primary pool to its configured backup
+
+### Job Move Process
+For each active job on a failing pool:
+1. **Disable** the job (requeue running tasks)
+2. **Update** the job's pool to the backup pool
+3. **Re-enable** the job (tasks run on backup pool)
+
+### Guards
+- Backup pools are **never** failed over (protected in code)
+- Unknown pools (not in `POOL_MAP`) are skipped
+- Jobs with `onAllTasksComplete: terminateJob` auto-terminate after tasks complete on the backup pool
 
 ## Prerequisites
 
-### Tools
-- Azure CLI
-- Bash (Linux shell) for the controller/submission helper
+### Azure Resources
+- Batch account with primary and backup pools
+- Log Analytics workspace
+- Container App (or any hosting for the .NET API)
+- Managed identity on the Container App with **Contributor** role on the Batch account
 
-### RBAC
-The identity running this needs rights to:
-- read pool state
-- resize pools
-- create jobs/tasks (if you use the submission helper)
+### Diagnostic Settings
+Enabled via `setup-log-based-alert.sh`:
+- **ServiceLog** → Log Analytics (captures `PoolResizeCompleteEvent`)
+- **AuditLog** → Log Analytics (captures API operations)
+- **AllMetrics** → Log Analytics (node counts, core counts)
 
----
-
-## Environment variables
-
-```bash
-export SUBSCRIPTION_ID="<subscription-id>"
-export RESOURCE_GROUP="<resource-group>"
-export BATCH_ACCOUNT="<batch-account-name>"
-
-export PRIMARY_POOL="pool-hbv4"
-export FALLBACK_POOL="pool-edsv5"
-
-# operational knobs
-export PERSIST_MINUTES=10          # N minutes: failure must persist this long
-export COOLDOWN_MINUTES=30         # prevents pool flapping
-export CHECK_INTERVAL_SECONDS=60   # how often controller runs when in loop mode
-
-# scale targets
-export PRIMARY_TARGET_NODES=0      # typically 0 during failover action
-export FALLBACK_TARGET_NODES=50
-
-# notification (optional)
-export WEBHOOK_URL=""             # Teams/LogicApp webhook; leave blank to disable
-```
-
----
-
-## 1) Enhanced controller: persistence window + cooldown (avoid flapping)
-
-### `failover-controller.sh`
+## Setup
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
+# 1. Deploy the API to Container App
+cd api
+az containerapp up --name batch-failover-api --resource-group <rg> --source .
 
-: "${SUBSCRIPTION_ID:?}"
-: "${RESOURCE_GROUP:?}"
-: "${BATCH_ACCOUNT:?}"
-: "${PRIMARY_POOL:?}"
-: "${FALLBACK_POOL:?}"
+# 2. Assign managed identity permissions
+az containerapp identity assign --name batch-failover-api --resource-group <rg> --system-assigned
+PRINCIPAL_ID=$(az containerapp show --name batch-failover-api --resource-group <rg> --query identity.principalId -o tsv)
+az role assignment create --assignee $PRINCIPAL_ID --role Contributor --scope <batch-account-resource-id>
 
-PERSIST_MINUTES=${PERSIST_MINUTES:-10}
-COOLDOWN_MINUTES=${COOLDOWN_MINUTES:-30}
-CHECK_INTERVAL_SECONDS=${CHECK_INTERVAL_SECONDS:-60}
+# 3. Set environment variables
+az containerapp update --name batch-failover-api --resource-group <rg> \
+  --set-env-vars \
+    "BATCH_ACCOUNT_URL=https://<account>.eastus.batch.azure.com" \
+    "POOL_MAP=<primary>:<backup>:<maxNodes>" \
+    "FAILOVER_THRESHOLD_PERCENT=0"
 
-PRIMARY_TARGET_NODES=${PRIMARY_TARGET_NODES:-0}
-FALLBACK_TARGET_NODES=${FALLBACK_TARGET_NODES:-50}
-
-STATE_DIR=${STATE_DIR:-"/tmp/org-x-batch-failover"}
-STATE_FILE="$STATE_DIR/state.env"
-mkdir -p "$STATE_DIR"
-
-now_epoch() { date +%s; }
-
-# state variables (defaults)
-FIRST_FAILURE_EPOCH=""
-LAST_FAILOVER_EPOCH=""
-ACTIVE_POOL=""
-FAILOVER_COUNT=0
-
-load_state() {
-  if [[ -f "$STATE_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$STATE_FILE" || true
-  fi
-}
-
-save_state() {
-  cat > "$STATE_FILE" <<EOF
-FIRST_FAILURE_EPOCH="${FIRST_FAILURE_EPOCH}"
-LAST_FAILOVER_EPOCH="${LAST_FAILOVER_EPOCH}"
-ACTIVE_POOL="${ACTIVE_POOL}"
-FAILOVER_COUNT=${FAILOVER_COUNT}
-EOF
-}
-
-pool_snapshot_tsv() {
-  local pool_id="$1"
-  az batch pool show \
-    --account-name "$BATCH_ACCOUNT" \
-    --resource-group "$RESOURCE_GROUP" \
-    --pool-id "$pool_id" \
-    --query "[allocationState,targetDedicatedNodes,currentDedicatedNodes]" \
-    -o tsv
-}
-
-is_allocation_failure() {
-  # Heuristic: target > 0, current == 0, allocationState == resizing
-  local alloc="$1"; local target="$2"; local current="$3"
-  if [[ "$alloc" == "resizing" && "$target" != "" && "$current" != "" ]]; then
-    if [[ "$target" -gt 0 && "$current" -eq 0 ]]; then
-      return 0
-    fi
-  fi
-  return 1
-}
-
-cooldown_active() {
-  if [[ -z "$LAST_FAILOVER_EPOCH" ]]; then
-    return 1
-  fi
-  local now; now=$(now_epoch)
-  local cooldown=$(( COOLDOWN_MINUTES * 60 ))
-  if (( now - LAST_FAILOVER_EPOCH < cooldown )); then
-    return 0
-  fi
-  return 1
-}
-
-notify() {
-  local message="$1"
-  if [[ -n "${WEBHOOK_URL:-}" ]]; then
-    curl -sS -X POST "$WEBHOOK_URL" \
-      -H "Content-Type: application/json" \
-      -d "{\"title\":\"Organization X Batch Failover\",\"message\":\"$message\"}" >/dev/null || true
-  fi
-}
-
-perform_failover() {
-  echo "[ACTION] Scaling down primary pool: $PRIMARY_POOL -> $PRIMARY_TARGET_NODES"
-  az batch pool resize \
-    --account-name "$BATCH_ACCOUNT" \
-    --resource-group "$RESOURCE_GROUP" \
-    --pool-id "$PRIMARY_POOL" \
-    --target-dedicated-nodes "$PRIMARY_TARGET_NODES"
-
-  echo "[ACTION] Scaling up fallback pool: $FALLBACK_POOL -> $FALLBACK_TARGET_NODES"
-  az batch pool resize \
-    --account-name "$BATCH_ACCOUNT" \
-    --resource-group "$RESOURCE_GROUP" \
-    --pool-id "$FALLBACK_POOL" \
-    --target-dedicated-nodes "$FALLBACK_TARGET_NODES"
-}
-
-step_once() {
-  az account set --subscription "$SUBSCRIPTION_ID" >/dev/null
-  load_state
-
-  # Get primary pool state
-  local line alloc target current
-  line=$(pool_snapshot_tsv "$PRIMARY_POOL")
-  alloc=$(echo "$line" | awk '{print $1}')
-  target=$(echo "$line" | awk '{print $2}')
-  current=$(echo "$line" | awk '{print $3}')
-
-  echo "[INFO] primary=$PRIMARY_POOL alloc=$alloc target=$target current=$current"
-
-  if is_allocation_failure "$alloc" "$target" "$current"; then
-    local now; now=$(now_epoch)
-
-    if [[ -z "$FIRST_FAILURE_EPOCH" ]]; then
-      FIRST_FAILURE_EPOCH=$now
-      save_state
-      echo "[WARN] Allocation failure detected on $PRIMARY_POOL. Starting persistence timer."
-      notify "Allocation failure detected on $PRIMARY_POOL. Starting persistence timer."
-      return 0
-    fi
-
-    if cooldown_active; then
-      echo "[INFO] Failure persists but cooldown is active; skipping failover."
-      return 0
-    fi
-
-    local persist_seconds=$(( PERSIST_MINUTES * 60 ))
-    local elapsed=$(( now - FIRST_FAILURE_EPOCH ))
-
-    if (( elapsed >= persist_seconds )); then
-      echo "[CRIT] Failure persisted for ${PERSIST_MINUTES}m. Triggering failover."
-      perform_failover
-
-      FAILOVER_COUNT=$(( FAILOVER_COUNT + 1 ))
-      LAST_FAILOVER_EPOCH=$now
-      ACTIVE_POOL="$FALLBACK_POOL"
-      FIRST_FAILURE_EPOCH=""
-      save_state
-
-      notify "Failover executed. Primary=$PRIMARY_POOL -> Fallback=$FALLBACK_POOL. failover_count=$FAILOVER_COUNT"
-    else
-      echo "[INFO] Failure ongoing. elapsed=${elapsed}s < persist=${persist_seconds}s."
-    fi
-  else
-    # No failure observed
-    if [[ -n "$FIRST_FAILURE_EPOCH" ]]; then
-      echo "[INFO] Failure cleared before persistence threshold. Resetting timer."
-      FIRST_FAILURE_EPOCH=""
-      save_state
-      notify "Allocation failure cleared on $PRIMARY_POOL before threshold."
-    fi
-  fi
-}
-
-loop() {
-  while true; do
-    step_once || true
-    sleep "$CHECK_INTERVAL_SECONDS"
-  done
-}
-
-case "${1:-}" in
-  --once) step_once ;;
-  --loop|"") loop ;;
-  *) echo "Usage: $0 [--once|--loop]"; exit 1 ;;
-esac
+# 4. Set up diagnostic logs + alert
+export SUBSCRIPTION_ID="..."
+export RESOURCE_GROUP="..."
+export BATCH_ACCOUNT="..."
+./setup-log-based-alert.sh
 ```
 
-**How it prevents flapping**
-- Requires failure to persist **PERSIST_MINUTES** before triggering.
-- Enforces **COOLDOWN_MINUTES** after a failover before allowing another.
+## Testing
 
----
-
-## 2) Job-level tagging for rerun traceability
-Azure CLI supports **job metadata** on `az batch job create`.
-
-### `submit-job-with-metadata.sh`
-
+### Manual mode (instant, calls webhook directly)
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-: "${SUBSCRIPTION_ID:?}"
-: "${RESOURCE_GROUP:?}"
-: "${BATCH_ACCOUNT:?}"
-: "${PRIMARY_POOL:?}"
-: "${FALLBACK_POOL:?}"
-
-JOB_PREFIX=${JOB_PREFIX:-"org-x-run"}
-TASKS_JSON=${TASKS_JSON:-"tasks.json"}
-
-STATE_DIR=${STATE_DIR:-"/tmp/org-x-batch-failover"}
-STATE_FILE="$STATE_DIR/state.env"
-
-az account set --subscription "$SUBSCRIPTION_ID" >/dev/null
-
-# Determine active pool (fallback if failover already happened; else primary)
-ACTIVE_POOL="$PRIMARY_POOL"
-if [[ -f "$STATE_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$STATE_FILE" || true
-  if [[ -n "${ACTIVE_POOL:-}" ]]; then
-    ACTIVE_POOL="$ACTIVE_POOL"
-  fi
-fi
-
-RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
-JOB_ID="${JOB_PREFIX}-${RUN_ID}"
-
-# Metadata keys are searchable and survive reruns
-az batch job create \
-  --account-name "$BATCH_ACCOUNT" \
-  --resource-group "$RESOURCE_GROUP" \
-  --id "$JOB_ID" \
-  --pool-id "$ACTIVE_POOL" \
-  --metadata \
-    runId="$RUN_ID" \
-    requestedPool="$PRIMARY_POOL" \
-    activePool="$ACTIVE_POOL" \
-    trace="failover-controller" \
-    jobPrefix="$JOB_PREFIX"
-
-# Pass run ID to tasks for easy correlation in stdout/logs
-az batch task create \
-  --account-name "$BATCH_ACCOUNT" \
-  --resource-group "$RESOURCE_GROUP" \
-  --job-id "$JOB_ID" \
-  --json-file "$TASKS_JSON" \
-  --environment-settings RUN_ID="$RUN_ID" ACTIVE_POOL="$ACTIVE_POOL"
-
-echo "Submitted job: $JOB_ID (pool=$ACTIVE_POOL, runId=$RUN_ID)"
+./test-failover-e2e.sh --manual
 ```
 
-**Traceability outcome**
-- Each job carries `runId`, `requestedPool`, `activePool`, and a `trace` marker.
-- Tasks get `RUN_ID` and `ACTIVE_POOL` injected as environment variables.
-
----
-
-## 3) Azure Monitor alert → Azure Automation Runbook
-You can trigger an Automation runbook from Azure Monitor using an **Action Group**, which calls the runbook via an HTTP POST (webhook). Use the **Common Alert Schema**.
-
-### Runbook: `runbook-HandleBatchAllocationAlert.ps1`
-
-```powershell
-param(
-  [Parameter(Mandatory=$false)]
-  [object] $WebhookData
-)
-
-Write-Output "Runbook started"
-
-if ($null -eq $WebhookData -or [string]::IsNullOrEmpty($WebhookData.RequestBody)) {
-  Write-Output "No WebhookData.RequestBody found. Exiting."
-  return
-}
-
-$payload = $WebhookData.RequestBody | ConvertFrom-Json
-
-$alertId = $payload.data.essentials.alertId
-$severity = $payload.data.essentials.severity
-$rule = $payload.data.essentials.alertRule
-
-Write-Output "AlertId=$alertId Severity=$severity Rule=$rule"
-
-# Hybrid Worker example: call controller once
-$cmd = "/bin/bash /opt/org-x/failover-controller.sh --once"
-Write-Output "Executing: $cmd"
-
-bash -c $cmd
-
-Write-Output "Runbook completed"
+### Wait mode (waits for real Azure Monitor alert)
+```bash
+./test-failover-e2e.sh
 ```
 
-### Wiring steps (high level)
-1. Enable Batch diagnostics to Log Analytics (ServiceLog/PoolResize events recommended).
-2. Create an Alert rule that detects pool resize failures.
-3. Attach an Action Group that triggers the Automation runbook (Common Alert Schema enabled).
+### What the test does
+1. Verifies the HB pool has a resize error
+2. Submits a job with a simple task on the failing pool
+3. Fires the webhook (manual) or waits for the alert (wait mode)
+4. Verifies the job moved to the backup pool
 
----
+## Timing
 
-## Recommended hardening checklist
-- Add a second failure signal (e.g., PoolResizeCompleteEvent resultCode != Success) in addition to the heuristic.
-- Store state in a durable place (Automation Variable, Key Vault, Storage) if not running on a single host.
-- Add “cooldown override” for manual operator actions.
-- Add ‘dry-run’ mode for testing.
+| Step | Latency |
+|------|---------|
+| Pool resize failure | Instant (quota rejection) |
+| ServiceLog ingestion to Log Analytics | ~2-5 min |
+| Scheduled query evaluation | Every 5 min |
+| Webhook call + API failover | ~1-3 sec |
+| **Total end-to-end** | **~5-10 min** |
 
----
+## Limitations
 
-## Status
-This is a starter operational kit intended to be reviewed and hardened before production.
+- Does **not** guarantee capacity on the backup pool
+- Does **not** support checkpointing — interrupted tasks are requeued from scratch
+- Log-based alerts depend on ServiceLog ingestion latency (~2-5 min)
+- The `PoolResizeCompleteEvent` is only emitted on resize operations — a pool that's already failed won't generate new events without a new resize (e.g. from autoscale)
+- Azure Monitor webhook calls have aggressive timeouts; the API may return 499 on long failover operations (the failover still completes)
