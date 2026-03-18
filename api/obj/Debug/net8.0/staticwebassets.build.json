@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "F/fqevnUksT3Gcm++nybarIaQtw1Me6IRj6712J4VNA=",
+  "Source": "BatchFailoverApi",
+  "BasePath": "_content/BatchFailoverApi",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}

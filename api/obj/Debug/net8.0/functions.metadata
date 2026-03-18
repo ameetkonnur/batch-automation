@@ -1,0 +1,29 @@
+[
+  {
+    "name": "BatchAllocationWebhook",
+    "scriptFile": "BatchFailoverApi.dll",
+    "entryPoint": "BatchFailoverApi.Functions.BatchAllocationWebhook.Run",
+    "language": "dotnet-isolated",
+    "properties": {
+      "IsCodeless": false
+    },
+    "bindings": [
+      {
+        "name": "req",
+        "direction": "In",
+        "type": "httpTrigger",
+        "authLevel": "Function",
+        "methods": [
+          "post"
+        ],
+        "route": "batch/allocation-alert",
+        "properties": {}
+      },
+      {
+        "name": "$return",
+        "type": "http",
+        "direction": "Out"
+      }
+    ]
+  }
+]

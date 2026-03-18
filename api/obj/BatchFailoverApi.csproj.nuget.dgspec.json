@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "restore": {
+    "/home/vmadmin/code/batch-automation/api/BatchFailoverApi.csproj": {}
+  },
+  "projects": {
+    "/home/vmadmin/code/batch-automation/api/BatchFailoverApi.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/home/vmadmin/code/batch-automation/api/BatchFailoverApi.csproj",
+        "projectName": "BatchFailoverApi",
+        "projectPath": "/home/vmadmin/code/batch-automation/api/BatchFailoverApi.csproj",
+        "packagesPath": "/home/vmadmin/.nuget/packages/",
+        "outputPath": "/home/vmadmin/code/batch-automation/api/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/home/vmadmin/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "dependencies": {
+            "Azure.Identity": {
+              "target": "Package",
+              "version": "[1.13.2, )"
+            },
+            "Microsoft.Azure.Batch": {
+              "target": "Package",
+              "version": "[16.2.0, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.AspNetCore.App": {
+              "privateAssets": "none"
+            },
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/lib/dotnet/sdk/8.0.125/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}
