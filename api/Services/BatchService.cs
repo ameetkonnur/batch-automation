@@ -105,7 +105,57 @@ public class BatchService
             var result = await EvaluateAndFailoverAsync(poolId, thresholdPercent);
             results.Add(result);
         }
+
+        // Check backup pool health — log critical warning if a backup pool also has failures.
+        // No failover action is taken for backup pools; this is informational only so
+        // operators are alerted that both primary AND backup are degraded.
+        await CheckBackupPoolHealthAsync();
+
         return results;
+    }
+
+    /// <summary>
+    /// Checks all backup pools for resize errors. Logs a critical warning if any
+    /// backup pool is also failing — this means jobs moved to it won't run either.
+    /// No failover action is taken; this is a monitoring/alerting signal only.
+    /// </summary>
+    private async Task CheckBackupPoolHealthAsync()
+    {
+        using var client = CreateBatchClient();
+        foreach (var fallbackPoolId in FallbackPoolIds)
+        {
+            try
+            {
+                var pool = await client.PoolOperations.GetPoolAsync(fallbackPoolId);
+                var hasResizeErrors = pool.ResizeErrors?.Any() == true;
+                var currentNodes = pool.CurrentDedicatedComputeNodes ?? 0;
+                var targetNodes = pool.TargetDedicatedComputeNodes ?? 0;
+
+                if (hasResizeErrors)
+                {
+                    var errorCodes = string.Join(", ", pool.ResizeErrors!.Select(e => e.Code));
+                    _logger.LogCritical(
+                        "[FAILOVER] CRITICAL: BACKUP pool '{PoolId}' ALSO has allocation failures! " +
+                        "Errors: {Errors}, currentNodes={Current}, targetNodes={Target}. " +
+                        "Jobs failed over to this pool will NOT run. Manual intervention required.",
+                        fallbackPoolId, errorCodes, currentNodes, targetNodes);
+                }
+                else if (currentNodes == 0 && targetNodes == 0)
+                {
+                    _logger.LogInformation("[FAILOVER] Backup pool '{PoolId}': idle (0 nodes, no errors — will autoscale when jobs arrive)",
+                        fallbackPoolId);
+                }
+                else
+                {
+                    _logger.LogInformation("[FAILOVER] Backup pool '{PoolId}': healthy (nodes={Current}/{Target}, no resize errors)",
+                        fallbackPoolId, currentNodes, targetNodes);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[FAILOVER] Failed to check backup pool '{PoolId}' health", fallbackPoolId);
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -118,10 +168,30 @@ public class BatchService
             poolId, thresholdPercent, PoolMap.Count);
 
         // ── STEP 1: Pool classification guard ──
-        // Guard: never failover a backup pool
+        // Guard: never failover a backup pool, but log if it has issues
         if (IsFallbackPool(poolId) && !IsPrimaryPool(poolId))
         {
-            _logger.LogInformation("[FAILOVER] Pool '{PoolId}' is a FALLBACK pool — skipping (only primary pools are failed over)", poolId);
+            _logger.LogWarning("[FAILOVER] Pool '{PoolId}' is a BACKUP pool — checking its health but NOT failing it over", poolId);
+
+            // Check if backup pool itself has allocation problems and log critically
+            try
+            {
+                using var checkClient = CreateBatchClient();
+                var backupPool = await checkClient.PoolOperations.GetPoolAsync(poolId);
+                if (backupPool.ResizeErrors?.Any() == true)
+                {
+                    var errors = string.Join(", ", backupPool.ResizeErrors!.Select(e => e.Code));
+                    _logger.LogCritical(
+                        "[FAILOVER] CRITICAL: BACKUP pool '{PoolId}' has allocation failures: {Errors}. " +
+                        "Jobs on this pool will NOT run. Manual intervention required.",
+                        poolId, errors);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[FAILOVER] Failed to check backup pool '{PoolId}' health", poolId);
+            }
+
             return new(poolId, "skipped", $"Pool '{poolId}' is a fallback pool — not eligible for failover");
         }
 

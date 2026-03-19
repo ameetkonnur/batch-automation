@@ -124,7 +124,7 @@ $TargetDedicatedNodes = ($tasks > 0) ? max(1, $tasks) : 0;
 
 ### Step-by-step flow in BatchService.cs
 
-1. **Pool classification guard** — reject if pool is a backup pool (never fail those over)
+1. **Pool classification guard** — reject if pool is a backup pool (never fail those over). If the backup pool itself has resize errors, a `CRITICAL` log is emitted.
 2. **Query pool status** — get `currentNodes`, `targetNodes`, `resizeErrors` from Batch API
 3. **Failover trigger decision** — if `resizeErrors` exist and `currentNodes < targetNodes` → trigger
 4. **Find active jobs** — list all Batch jobs in `active` state on the failing pool
@@ -132,16 +132,24 @@ $TargetDedicatedNodes = ($tasks > 0) ? max(1, $tasks) : 0;
 6. **Per-job evaluation**:
    - **Job completion gate** — if `completedTasks / totalTasks >= JOB_COMPLETION_THRESHOLD_PERCENT`, skip (let it finish)
    - **Move job** — disable (requeue tasks) → wait for disabled state → update pool to backup → re-enable
+7. **Backup pool health check** — after evaluating all primary pools, the API checks every backup pool for resize errors. If a backup pool also has allocation failures, a `CRITICAL` log is emitted:
+   ```
+   [FAILOVER] CRITICAL: BACKUP pool 'pool-ev3' ALSO has allocation failures!
+   Errors: AccountVMSeriesCoreQuotaReached. Jobs on this pool will NOT run.
+   Manual intervention required.
+   ```
 
 > **Note:** After disabling a job, the API waits up to 10 seconds for the job to fully transition to `disabled` state before updating the pool. This prevents a race condition where the pool update fails with "job is not in disabled state".
+
+> **Note:** Backup pools are never automatically failed over. If a backup pool also fails, the API logs a `CRITICAL` warning but takes no further action — manual intervention is required.
 
 ### Two alert types handled
 
 #### Metric-based alert (poolId in dimensions)
-The API extracts `poolId` from `alertContext.condition.allOf[].dimensions`, verifies it's a primary pool, and evaluates just that pool.
+The API extracts `poolId` from `alertContext.condition.allOf[].dimensions`, verifies it's a primary pool, and evaluates just that pool. If the poolId is a backup pool, the API checks its health and logs a critical warning if it has errors.
 
 #### Log-based alert (no poolId)
-The API scans ALL primary pools in `POOL_MAP` and evaluates each one. Backup pools are always skipped.
+The API scans ALL primary pools in `POOL_MAP` and evaluates each one. After processing, it checks all backup pools for health and logs critical warnings for any that are also failing.
 
 ---
 
@@ -365,7 +373,7 @@ az batch job show --job-id <job-id> --query '{pool:poolInfo.poolId,state:state}'
 
 ## Limitations
 
-- Does **not** guarantee capacity on the backup pool
+- Does **not** guarantee capacity on the backup pool — if the backup pool also fails, a `CRITICAL` log is emitted but no further automatic action is taken
 - Does **not** support checkpointing — interrupted tasks are requeued from scratch
 - Log-based alerts depend on ServiceLog ingestion latency (~2-5 min)
 - The `PoolResizeCompleteEvent` is only emitted on resize operations — with autoscale enabled, this happens every evaluation interval (5 min)
@@ -381,3 +389,4 @@ az batch job show --job-id <job-id> --query '{pool:poolInfo.poolId,state:state}'
 | Job left in `disabled` state after failover | Race condition — pool update attempted before job fully transitions to disabled | API now waits up to 10s for disabled state before updating pool |
 | Alert fires but returns HTTP 499 | Azure Monitor webhook timeout (<5s) | Failover still completes; Azure Monitor retries the call |
 | No `PoolResizeCompleteEvent` after job submit | Fixed-size pool with existing errors doesn't generate new events | Enable autoscale — it re-evaluates every 5 min, generating fresh events |
+| Backup pool also has allocation failures | Quota/capacity exhausted on backup pool too | API logs `CRITICAL` warning; manual intervention required. Consider adding a third pool as backup-for-backup via chained `POOL_MAP` entries |
