@@ -31,6 +31,15 @@ public class BatchService
         return map;
     }
 
+    // Failover gate thresholds (configurable via env vars)
+    // Jobs are only moved if BOTH conditions are met:
+    //   1. Job completion % is BELOW this threshold (e.g. 50 = move if less than 50% done)
+    //   2. Current nodes are BELOW this % of autoscale max (e.g. 20 = move if pool has < 20% of max nodes)
+    private static readonly int JobCompletionThreshold =
+        int.TryParse(Environment.GetEnvironmentVariable("JOB_COMPLETION_THRESHOLD_PERCENT"), out var jc) ? jc : 90;
+    private static readonly int NodeAvailabilityThreshold =
+        int.TryParse(Environment.GetEnvironmentVariable("NODE_AVAILABILITY_THRESHOLD_PERCENT"), out var na) ? na : 20;
+
     public BatchService(ILogger<BatchService> logger)
     {
         _logger = logger;
@@ -39,6 +48,8 @@ public class BatchService
             _logger.LogInformation("[CONFIG]   {Primary} → {Backup} (maxNodes={Max})", primary, config.FallbackPoolId, config.MaxDedicatedNodes);
         if (FallbackPoolIds.Count > 0)
             _logger.LogInformation("[CONFIG] Protected backup pools (never failed over): [{Backups}]", string.Join(", ", FallbackPoolIds));
+        _logger.LogInformation("[CONFIG] Job completion threshold: {Threshold}% (move only if below this)", JobCompletionThreshold);
+        _logger.LogInformation("[CONFIG] Node availability threshold: {Threshold}% of autoscale max (move only if below this)", NodeAvailabilityThreshold);
     }
 
     // Set of all fallback pool IDs — these must never be failed over
@@ -153,15 +164,47 @@ public class BatchService
             return new(poolId, "no_jobs", "Threshold met but no active jobs to move", poolConfig.FallbackPoolId);
         }
 
-        _logger.LogInformation("[FAILOVER] Found {Count} active job(s) on pool '{PoolId}' to move: [{JobIds}]",
+        _logger.LogInformation("[FAILOVER] Found {Count} active job(s) on pool '{PoolId}' to evaluate: [{JobIds}]",
             jobIds.Count, poolId, string.Join(", ", jobIds));
 
-        // Move each job: disable → update pool → re-enable
+        // Gate check: node availability — skip failover if pool has enough nodes
+        var nodeAvailPct = poolConfig.MaxDedicatedNodes > 0
+            ? (double)currentNodes / poolConfig.MaxDedicatedNodes * 100 : 0;
+        _logger.LogInformation("[FAILOVER] Node availability: {Current}/{Max} = {Pct:F1}% (threshold: below {Threshold}%)",
+            currentNodes, poolConfig.MaxDedicatedNodes, nodeAvailPct, NodeAvailabilityThreshold);
+
+        if (nodeAvailPct >= NodeAvailabilityThreshold)
+        {
+            var skipReason = $"Node availability ({nodeAvailPct:F1}%) >= threshold ({NodeAvailabilityThreshold}%) — pool has enough nodes, skipping failover";
+            _logger.LogInformation("[FAILOVER] GATE: {Reason}", skipReason);
+            return new(poolId, "skipped", skipReason, poolConfig.FallbackPoolId);
+        }
+
+        // Move each job: check completion % gate, then disable → update pool → re-enable
         var results = new List<MoveJobResult>();
         foreach (var jobId in jobIds)
         {
             try
             {
+                // Gate check: job completion % — skip if job is nearly done
+                var taskCounts = await client.JobOperations.GetJobTaskCountsAsync(jobId);
+                var totalTasks = taskCounts.TaskCounts.Active + taskCounts.TaskCounts.Running + taskCounts.TaskCounts.Completed;
+                var completionPct = totalTasks > 0 ? (double)taskCounts.TaskCounts.Completed / totalTasks * 100 : 0;
+
+                _logger.LogInformation("[FAILOVER] Job '{JobId}' task progress: completed={Completed}, active={Active}, running={Running}, total={Total}, completion={Pct:F1}% (threshold: below {Threshold}%)",
+                    jobId, taskCounts.TaskCounts.Completed, taskCounts.TaskCounts.Active, taskCounts.TaskCounts.Running, totalTasks, completionPct, JobCompletionThreshold);
+
+                if (completionPct >= JobCompletionThreshold)
+                {
+                    _logger.LogInformation("[FAILOVER] GATE: Job '{JobId}' is {Pct:F1}% complete (>= {Threshold}%) — letting it finish on current pool",
+                        jobId, completionPct, JobCompletionThreshold);
+                    results.Add(new(jobId, poolConfig.FallbackPoolId, false, $"Skipped: {completionPct:F1}% complete (>= {JobCompletionThreshold}% threshold)"));
+                    continue;
+                }
+
+                _logger.LogInformation("[FAILOVER] GATE PASSED: Job '{JobId}' completion={Pct:F1}% < {Threshold}%, nodes={NodePct:F1}% < {NodeThreshold}% — proceeding with move",
+                    jobId, completionPct, JobCompletionThreshold, nodeAvailPct, NodeAvailabilityThreshold);
+
                 _logger.LogInformation("[FAILOVER] Moving job '{JobId}': {SourcePool} → {TargetPool} (disable → update pool → re-enable)",
                     jobId, poolId, poolConfig.FallbackPoolId);
 
