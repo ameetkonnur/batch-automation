@@ -7,6 +7,11 @@ builder.Services.AddSingleton<BatchService>();
 
 var app = builder.Build();
 
+// ────────────────────────────────────────────────────────────────────────
+// WEBHOOK ENDPOINT: Receives Azure Monitor alerts (Common Alert Schema)
+// Handles both metric-based alerts (poolId in dimensions) and
+// log-based alerts (no poolId — scans all primary pools).
+// ────────────────────────────────────────────────────────────────────────
 app.MapPost("/api/batch/allocation-alert", async (HttpContext ctx, BatchService batchService, ILogger<Program> logger) =>
 {
     var thresholdPercent = int.TryParse(Environment.GetEnvironmentVariable("FAILOVER_THRESHOLD_PERCENT"), out var v) ? v : 80;

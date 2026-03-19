@@ -6,8 +6,28 @@ using Microsoft.Extensions.Logging;
 
 namespace BatchFailoverApi.Services;
 
+/// <summary>
+/// Core failover service for Azure Batch pool allocation failures.
+///
+/// Monitors primary pools for resize errors and moves active jobs to backup pools.
+/// Pool mappings are configured via POOL_MAP env var. Backup pools are protected
+/// and never failed over themselves.
+///
+/// Failover decision flow:
+///   1. Check if pool is a primary (not a backup) pool
+///   2. Query pool status from Batch API for resize errors
+///   3. If resize errors exist and current nodes < target → trigger failover
+///   4. Gate: skip if node availability is above threshold (pool has enough nodes)
+///   5. For each active job on the pool:
+///      a. Gate: skip if job completion % is above threshold (nearly done)
+///      b. Disable job (requeue tasks) → update pool to backup → re-enable job
+/// </summary>
 public class BatchService
 {
+    // ────────────────────────────────────────────────────────────────────────
+    // CONFIGURATION: Pool mappings and failover thresholds
+    // ────────────────────────────────────────────────────────────────────────
+
     private readonly ILogger<BatchService> _logger;
 
     // Configured via POOL_MAP env var: "primary1:backup1:maxNodes,primary2:backup2:maxNodes,..."
@@ -52,6 +72,10 @@ public class BatchService
         _logger.LogInformation("[CONFIG] Node availability threshold: {Threshold}% of autoscale max (move only if below this)", NodeAvailabilityThreshold);
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // POOL CLASSIFICATION: Primary vs backup pool lookups
+    // ────────────────────────────────────────────────────────────────────────
+
     // Set of all fallback pool IDs — these must never be failed over
     private static readonly HashSet<string> FallbackPoolIds = new(
         PoolMap.Values.Select(c => c.FallbackPoolId), StringComparer.OrdinalIgnoreCase);
@@ -67,6 +91,10 @@ public class BatchService
     public bool IsFallbackPool(string poolId) =>
         FallbackPoolIds.Contains(poolId);
 
+    // ────────────────────────────────────────────────────────────────────────
+    // EVALUATE ALL POOLS: Scans every primary pool (used by log-based alerts)
+    // ────────────────────────────────────────────────────────────────────────
+
     public async Task<List<FailoverResult>> EvaluateAllPoolsAsync(int thresholdPercent)
     {
         _logger.LogInformation("[FAILOVER] Scanning {PrimaryCount} primary pool(s), skipping {FallbackCount} fallback pool(s)",
@@ -80,11 +108,16 @@ public class BatchService
         return results;
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // EVALUATE SINGLE POOL: Core failover logic for one primary pool
+    // ────────────────────────────────────────────────────────────────────────
+
     public async Task<FailoverResult> EvaluateAndFailoverAsync(string poolId, int thresholdPercent)
     {
         _logger.LogInformation("[FAILOVER] Evaluating pool '{PoolId}' — threshold={Threshold}%, poolMap entries={MapCount}",
             poolId, thresholdPercent, PoolMap.Count);
 
+        // ── STEP 1: Pool classification guard ──
         // Guard: never failover a backup pool
         if (IsFallbackPool(poolId) && !IsPrimaryPool(poolId))
         {
@@ -102,6 +135,7 @@ public class BatchService
         _logger.LogInformation("[FAILOVER] Pool '{PoolId}' maps to fallback '{FallbackPool}' (maxNodes={MaxNodes})",
             poolId, poolConfig.FallbackPoolId, poolConfig.MaxDedicatedNodes);
 
+        // ── STEP 2: Query pool status from Batch API ──
         using var client = CreateBatchClient();
 
         var pool = await client.PoolOperations.GetPoolAsync(poolId);
@@ -119,6 +153,7 @@ public class BatchService
                     poolId, err.Code, err.Message);
         }
 
+        // ── STEP 3: Failover trigger decision ──
         // Allocation failure: pool requested nodes but couldn't allocate (quota, capacity, etc.)
         bool shouldFailover;
         string triggerReason;
@@ -148,7 +183,7 @@ public class BatchService
             return new(poolId, "skipped", triggerReason, poolConfig.FallbackPoolId);
         }
 
-        // Find active jobs on the source pool
+        // ── STEP 4: Find active jobs on the failing pool ──
         var filter = new ODATADetailLevel(filterClause: "state eq 'active'");
         var jobIds = new List<string>();
         var enumerator = client.JobOperations.ListJobs(filter).GetPagedEnumerator();
@@ -167,6 +202,7 @@ public class BatchService
         _logger.LogInformation("[FAILOVER] Found {Count} active job(s) on pool '{PoolId}' to evaluate: [{JobIds}]",
             jobIds.Count, poolId, string.Join(", ", jobIds));
 
+        // ── STEP 5: Node availability gate ──
         // Gate check: node availability — skip failover if pool has enough nodes
         var nodeAvailPct = poolConfig.MaxDedicatedNodes > 0
             ? (double)currentNodes / poolConfig.MaxDedicatedNodes * 100 : 0;
@@ -180,12 +216,14 @@ public class BatchService
             return new(poolId, "skipped", skipReason, poolConfig.FallbackPoolId);
         }
 
+        // ── STEP 6: Per-job evaluation and move ──
         // Move each job: check completion % gate, then disable → update pool → re-enable
         var results = new List<MoveJobResult>();
         foreach (var jobId in jobIds)
         {
             try
             {
+                // ── STEP 6a: Job completion gate ──
                 // Gate check: job completion % — skip if job is nearly done
                 var taskCounts = await client.JobOperations.GetJobTaskCountsAsync(jobId);
                 var totalTasks = taskCounts.TaskCounts.Active + taskCounts.TaskCounts.Running + taskCounts.TaskCounts.Completed;
@@ -238,6 +276,10 @@ public class BatchService
             $"Moved {moved} job(s) to fallback pool. Trigger: {triggerReason}",
             poolConfig.FallbackPoolId, results);
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // BATCH CLIENT: Authenticates via managed identity (DefaultAzureCredential)
+    // ────────────────────────────────────────────────────────────────────────
 
     private BatchClient CreateBatchClient()
     {
