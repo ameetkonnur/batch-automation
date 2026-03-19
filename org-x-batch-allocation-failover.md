@@ -1,5 +1,7 @@
 # Azure Batch Allocation Failover Automation
 
+> **DISCLAIMER:** This code is provided on a best-effort basis for reference and educational purposes only. It is **not** validated, endorsed, or supported by Microsoft. This is **not** production-ready code. Organizations using this code should review, test, and adapt it to their own organizational coding standards, including security, compliance, and operational requirements. Microsoft provides no warranties, guarantees, or support for this code and cannot be held responsible for any issues, damages, or losses arising from its use. Use at your own risk.
+
 ## Problem
 
 Azure Batch pool allocations can fail even when quota exists — capacity may not be available at allocation time. When autoscale triggers or a manual resize requests nodes, the pool can end up with `resizeErrors` (e.g. `AccountVMSeriesCoreQuotaReached`) and zero running nodes. Jobs submitted to that pool are stuck and require manual intervention.
