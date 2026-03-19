@@ -249,6 +249,16 @@ public class BatchService
                 await client.JobOperations.DisableJobAsync(jobId, DisableJobOption.Requeue);
                 _logger.LogInformation("[FAILOVER] Job '{JobId}': disabled (tasks requeued)", jobId);
 
+                // Wait for job to fully transition to 'disabled' state before updating pool.
+                // Without this, the pool update can fail with "job is not in disabled state".
+                for (var wait = 0; wait < 10; wait++)
+                {
+                    var jobState = (await client.JobOperations.GetJobAsync(jobId)).State;
+                    if (jobState == Microsoft.Azure.Batch.Common.JobState.Disabled) break;
+                    _logger.LogInformation("[FAILOVER] Job '{JobId}': waiting for disabled state (current: {State})...", jobId, jobState);
+                    await Task.Delay(1000);
+                }
+
                 var job = await client.JobOperations.GetJobAsync(jobId);
                 job.PoolInformation = new PoolInformation { PoolId = poolConfig.FallbackPoolId };
                 await job.CommitAsync();
