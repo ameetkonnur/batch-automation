@@ -6,19 +6,24 @@ Azure Batch pool allocations can fail even when quota exists — capacity may no
 
 ## Solution
 
-An automated failover system that detects pool allocation failures via Azure Monitor and moves active jobs from the failing primary pool to a healthy backup pool.
+An automated failover system that:
+1. Detects pool allocation failures via Azure Monitor (log-based and metric-based alerts)
+2. Evaluates whether failover is needed (configurable gates)
+3. Moves active jobs from the failing primary pool to a healthy backup pool
 
 ```
-Pool resize fails
-  → Batch writes PoolResizeCompleteEvent (Failure) to ServiceLog
+Pool resize fails (autoscale or manual)
+  → Batch writes PoolResizeCompleteEvent(Failure) to ServiceLog
   → ServiceLog ingested into Log Analytics (~2-5 min)
   → Scheduled Query Rule alert evaluates every 5 min (10 min window)
   → Alert fires → Action Group → Webhook
   → .NET API (Container App) receives alert
-  → API checks POOL_MAP: only primary pools are evaluated (backup pools are never failed over)
-  → API detects resize errors on primary pool
-  → Active jobs are moved: disable → update pool → re-enable
-  → Jobs run on backup pool
+  → API checks POOL_MAP: only primary pools are evaluated
+  → API evaluates gates:
+      Gate 1: Node availability < threshold % of autoscale max?
+      Gate 2: Job completion < threshold %?
+  → If both gates pass: disable job → update pool → re-enable
+  → Jobs run on backup pool (autoscales up, then back to 0 when idle)
 ```
 
 ## Architecture
@@ -52,20 +57,21 @@ Pool resize fails
 
 | File | Purpose |
 |------|---------|
-| `api/` | .NET 8 ASP.NET Core API deployed as a Container App. Receives alert webhooks and performs job failover. |
-| `api/Program.cs` | Webhook endpoint. Handles both metric-based alerts (poolId in dimensions) and log-based alerts (scans all primary pools). |
-| `api/Services/BatchService.cs` | Core failover logic. Parses `POOL_MAP`, detects resize errors, moves jobs between pools. |
-| `api/Models/AlertPayload.cs` | Azure Monitor Common Alert Schema model. |
-| `api/Dockerfile` | Container image build for the API. |
-| `setup-log-based-alert.sh` | Creates diagnostic settings, Log Analytics workspace config, and Scheduled Query Rule alert. |
-| `test-failover-e2e.sh` | End-to-end test script. `--wait` mode waits for real alert; `--manual` mode calls webhook directly. |
-| `submit-job-with-metadata.sh` | Job submission utility with metadata for traceability. |
+| `api/Program.cs` | Webhook endpoint. Handles both metric-based and log-based alerts. Routes to failover logic. |
+| `api/Services/BatchService.cs` | Core failover logic. Pool mapping, gate checks, job move operations. |
+| `api/Models/AlertPayload.cs` | Azure Monitor Common Alert Schema deserialization model. |
+| `api/Dockerfile` | Container image build. |
+| `api/BatchFailoverApi.csproj` | .NET 8 project file with dependencies. |
+| `setup-log-based-alert.sh` | Creates diagnostic settings, Log Analytics config, and Scheduled Query Rule alert. |
+| `submit-job.sh` | Job submission script. Submits to primary pool and optionally waits for failover. |
+
+---
 
 ## Configuration
 
-### POOL_MAP (Environment Variable on Container App)
+### POOL_MAP
 
-Maps primary pools to their backup pools. Format:
+Maps primary pools to their backup pools. Set as an environment variable on the Container App.
 
 ```
 POOL_MAP="primary1:backup1:maxNodes,primary2:backup2:maxNodes,..."
@@ -73,35 +79,168 @@ POOL_MAP="primary1:backup1:maxNodes,primary2:backup2:maxNodes,..."
 
 Example:
 ```
-POOL_MAP="pool-hbv4:pool-ev3:2,pool-nc:pool-nv:10"
+POOL_MAP="pool-hbv4-err-20260317T091514Z:pool-ev3-swedencentral-20260317T091042Z:2"
 ```
 
 - **Primary pools** (keys) — monitored for failures, jobs are moved FROM these
 - **Backup pools** (values) — jobs are moved TO these, never failed over themselves
-- **maxNodes** — maximum dedicated nodes for utilization-based failover (optional, default 100)
+- **maxNodes** — autoscale max for the primary pool (used in node availability gate)
 
-### Other Environment Variables
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BATCH_ACCOUNT_URL` | required | Batch account endpoint (e.g. `https://myaccount.eastus.batch.azure.com`) |
 | `POOL_MAP` | required | Primary-to-backup pool mapping (see above) |
-| `FAILOVER_THRESHOLD_PERCENT` | `80` | Utilization threshold for capacity-based failover. Set to `0` to skip utilization check and failover on any resize error. |
+| `FAILOVER_THRESHOLD_PERCENT` | `80` | Utilization threshold. Set to `0` to skip utilization check. |
+| `JOB_COMPLETION_THRESHOLD_PERCENT` | `90` | Jobs above this completion % are left on the current pool to finish. |
+| `NODE_AVAILABILITY_THRESHOLD_PERCENT` | `20` | If current nodes are above this % of autoscale max, skip failover (pool has enough nodes). |
 
-### Alert Configuration
+### Autoscale
 
-Set via `setup-log-based-alert.sh`:
+Both pools should have autoscale enabled:
 
-| Setting | Value | Description |
-|---------|-------|-------------|
-| Evaluation frequency | 5 min | How often the KQL query runs |
-| Window size | 10 min | How far back the query looks for failure events |
-| Auto-mitigate | false | Alert fires every cycle while failures exist |
-| Severity | Sev1 | High severity |
+**Primary pool** — scales to 1+ when jobs have pending tasks, generates `PoolResizeCompleteEvent(Failure)` when allocation fails:
+```
+$samples = $PendingTasks.GetSamplePercent(TimeInterval_Minute * 5);
+$tasks = ($samples < 70) ? 0 : max($PendingTasks.GetSample(1));
+$targetDedicatedNodes = ($tasks > 0) ? 1 : 0;
+```
 
-### KQL Alert Query
+**Backup pool** — scales up for tasks, back to 0 when idle (saves cost):
+```
+$samples = $PendingTasks.GetSamplePercent(TimeInterval_Minute * 5);
+$tasks = ($samples < 70) ? max(0, $TargetDedicatedNodes) : max($PendingTasks.GetSample(1));
+$targetDedicatedNodes = ($tasks > 0) ? max(1, $tasks) : 0;
+```
 
-Pool-agnostic — fires for any pool with resize failures. The API determines which pools are primary vs backup.
+---
+
+## Failover Logic
+
+### Step-by-step flow in BatchService.cs
+
+1. **Pool classification guard** — reject if pool is a backup pool (never fail those over)
+2. **Query pool status** — get `currentNodes`, `targetNodes`, `resizeErrors` from Batch API
+3. **Failover trigger decision** — if `resizeErrors` exist and `currentNodes < targetNodes` → trigger
+4. **Find active jobs** — list all Batch jobs in `active` state on the failing pool
+5. **Node availability gate** — if `currentNodes / maxNodes >= NODE_AVAILABILITY_THRESHOLD_PERCENT`, skip (pool has enough capacity)
+6. **Per-job evaluation**:
+   - **Job completion gate** — if `completedTasks / totalTasks >= JOB_COMPLETION_THRESHOLD_PERCENT`, skip (let it finish)
+   - **Move job** — disable (requeue tasks) → update pool to backup → re-enable
+
+### Two alert types handled
+
+#### Metric-based alert (poolId in dimensions)
+The API extracts `poolId` from `alertContext.condition.allOf[].dimensions`, verifies it's a primary pool, and evaluates just that pool.
+
+#### Log-based alert (no poolId)
+The API scans ALL primary pools in `POOL_MAP` and evaluates each one. Backup pools are always skipped.
+
+---
+
+## Alert Payloads
+
+### Metric-based alert payload (Common Alert Schema)
+
+Sent by Azure Monitor metric alerts (e.g. `CreatingNodeCount > 0`). Contains `poolId` in dimensions.
+
+```json
+{
+  "schemaId": "azureMonitorCommonAlertSchema",
+  "data": {
+    "essentials": {
+      "alertId": "/subscriptions/.../alerts/abc123",
+      "alertRule": "batch-alloc-failure-stuck-creating",
+      "severity": "Sev1",
+      "signalType": "Metric",
+      "monitorCondition": "Fired",
+      "monitoringService": "Platform",
+      "alertTargetIDs": [
+        "/subscriptions/.../providers/Microsoft.Batch/batchAccounts/myaccount"
+      ],
+      "firedDateTime": "2026-03-18T13:37:00.000Z",
+      "description": "Nodes stuck in Creating state"
+    },
+    "alertContext": {
+      "conditionType": "SingleResourceMultipleMetricCriteria",
+      "condition": {
+        "windowSize": "PT5M",
+        "allOf": [
+          {
+            "metricName": "CreatingNodeCount",
+            "metricNamespace": "Microsoft.Batch/batchAccounts",
+            "operator": "GreaterThan",
+            "threshold": "0",
+            "timeAggregation": "Average",
+            "metricValue": 9999.0,
+            "dimensions": [
+              {
+                "name": "poolId",
+                "value": "pool-hbv4-err-20260317T091514Z"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+**API behavior:** Extracts `poolId` from `dimensions` → evaluates that specific pool → skips if it's a backup pool.
+
+### Log-based alert payload (Common Alert Schema)
+
+Sent by Scheduled Query Rule alerts. Does **not** contain `poolId` in dimensions — the query results are in a different structure.
+
+```json
+{
+  "schemaId": "azureMonitorCommonAlertSchema",
+  "data": {
+    "essentials": {
+      "alertId": "/subscriptions/.../alerts/def456",
+      "alertRule": "batch-resize-error-log-alert",
+      "severity": "Sev1",
+      "signalType": "Log",
+      "monitorCondition": "Fired",
+      "monitoringService": "Log Alerts V2",
+      "alertTargetIDs": [
+        "/subscriptions/.../providers/Microsoft.OperationalInsights/workspaces/myworkspace"
+      ],
+      "firedDateTime": "2026-03-18T13:37:32.916Z",
+      "description": "Batch pool resize failed"
+    },
+    "alertContext": {
+      "conditionType": "LogQueryCriteria",
+      "condition": {
+        "windowSize": "PT10M",
+        "allOf": [
+          {
+            "searchQuery": "AzureDiagnostics | where OperationName == 'PoolResizeCompleteEvent' ...",
+            "metricValue": 1,
+            "operator": "GreaterThan",
+            "threshold": "0",
+            "timeAggregation": "Count",
+            "linkToSearchResultsUI": "https://portal.azure.com#...",
+            "linkToFilteredSearchResultsUI": "https://portal.azure.com#..."
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+**API behavior:** No `poolId` in dimensions → scans **all primary pools** in `POOL_MAP` → evaluates each for resize errors → moves jobs from any that are failing.
+
+---
+
+## Alert Configuration
+
+### KQL Query (Scheduled Query Rule)
+
+Pool-agnostic — fires for any pool with resize failures. The API determines primary vs backup.
 
 ```kql
 AzureDiagnostics
@@ -113,45 +252,26 @@ AzureDiagnostics
 | summarize ErrorCount=count(), arg_max(TimeGenerated, *) by poolId
 ```
 
-## Failover Logic
+### Alert Settings
 
-The API handles two alert types:
-
-### Metric-based alerts (poolId in dimensions)
-1. Extract `poolId` from `alertContext.condition.allOf[].dimensions`
-2. Check if poolId is a primary pool (in `POOL_MAP` keys) — skip if it's a backup
-3. Query pool status via Batch API
-4. If resize errors detected: find active jobs on that pool and move them
-
-### Log-based alerts (no poolId in dimensions)
-1. Scan ALL primary pools in `POOL_MAP`
-2. For each primary pool: query status, check for resize errors
-3. Move active jobs from any failing primary pool to its configured backup
-
-### Job Move Process
-For each active job on a failing pool:
-1. **Disable** the job (requeue running tasks)
-2. **Update** the job's pool to the backup pool
-3. **Re-enable** the job (tasks run on backup pool)
-
-### Guards
-- Backup pools are **never** failed over (protected in code)
-- Unknown pools (not in `POOL_MAP`) are skipped
-- Jobs with `onAllTasksComplete: terminateJob` auto-terminate after tasks complete on the backup pool
-
-## Prerequisites
-
-### Azure Resources
-- Batch account with primary and backup pools
-- Log Analytics workspace
-- Container App (or any hosting for the .NET API)
-- Managed identity on the Container App with **Contributor** role on the Batch account
+| Setting | Value | Why |
+|---------|-------|-----|
+| Evaluation frequency | 5 min | Balance between responsiveness and cost |
+| Window size | 10 min | Accounts for log ingestion delay (~2-5 min) |
+| Auto-mitigate | false | Fires every cycle while failures exist (enables repeated failover for new jobs) |
+| Severity | Sev1 | High priority |
 
 ### Diagnostic Settings
+
 Enabled via `setup-log-based-alert.sh`:
-- **ServiceLog** → Log Analytics (captures `PoolResizeCompleteEvent`)
-- **AuditLog** → Log Analytics (captures API operations)
-- **AllMetrics** → Log Analytics (node counts, core counts)
+
+| Category | Purpose |
+|----------|---------|
+| ServiceLog | Pool resize events (`PoolResizeCompleteEvent`, `PoolResizeStartEvent`) |
+| AuditLog | Data-plane API operations (`GetJob`, `ResizePool`) |
+| AllMetrics | Node counts, core counts |
+
+---
 
 ## Setup
 
@@ -163,54 +283,70 @@ az containerapp up --name batch-failover-api --resource-group <rg> --source .
 # 2. Assign managed identity permissions
 az containerapp identity assign --name batch-failover-api --resource-group <rg> --system-assigned
 PRINCIPAL_ID=$(az containerapp show --name batch-failover-api --resource-group <rg> --query identity.principalId -o tsv)
-az role assignment create --assignee $PRINCIPAL_ID --role Contributor --scope <batch-account-resource-id>
+BATCH_ID="/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Batch/batchAccounts/<account>"
+az role assignment create --assignee $PRINCIPAL_ID --role Contributor --scope $BATCH_ID
 
 # 3. Set environment variables
 az containerapp update --name batch-failover-api --resource-group <rg> \
   --set-env-vars \
     "BATCH_ACCOUNT_URL=https://<account>.eastus.batch.azure.com" \
     "POOL_MAP=<primary>:<backup>:<maxNodes>" \
-    "FAILOVER_THRESHOLD_PERCENT=0"
+    "FAILOVER_THRESHOLD_PERCENT=0" \
+    "JOB_COMPLETION_THRESHOLD_PERCENT=90" \
+    "NODE_AVAILABILITY_THRESHOLD_PERCENT=20"
 
 # 4. Set up diagnostic logs + alert
-export SUBSCRIPTION_ID="..."
-export RESOURCE_GROUP="..."
-export BATCH_ACCOUNT="..."
+export SUBSCRIPTION_ID="..." RESOURCE_GROUP="..." BATCH_ACCOUNT="..."
 ./setup-log-based-alert.sh
+
+# 5. Enable autoscale on pools
+az batch pool autoscale enable --pool-id <primary-pool> \
+  --auto-scale-formula '<formula>' --auto-scale-evaluation-interval PT5M
+az batch pool autoscale enable --pool-id <backup-pool> \
+  --auto-scale-formula '<formula>' --auto-scale-evaluation-interval PT5M
 ```
 
 ## Testing
 
-### Manual mode (instant, calls webhook directly)
 ```bash
-./test-failover-e2e.sh --manual
+# Submit a job and wait for the real Azure Monitor alert to fire and move it
+./submit-job.sh --wait
+
+# Submit a job only (check status manually later)
+./submit-job.sh
+
+# Custom task command
+COMMAND="/bin/bash -c 'my-script.sh'" ./submit-job.sh --wait
 ```
 
-### Wait mode (waits for real Azure Monitor alert)
-```bash
-./test-failover-e2e.sh
-```
-
-### What the test does
-1. Verifies the HB pool has a resize error
-2. Submits a job with a simple task on the failing pool
-3. Fires the webhook (manual) or waits for the alert (wait mode)
-4. Verifies the job moved to the backup pool
+### What happens
+1. Job is submitted to the primary pool
+2. Autoscale attempts to allocate nodes → fails (quota/capacity)
+3. `PoolResizeCompleteEvent(Failure)` is written to ServiceLog
+4. Log Analytics ingests the event (~2-5 min)
+5. Scheduled Query Rule alert evaluates and fires
+6. Webhook calls the API
+7. API scans primary pools, finds the failure
+8. API checks gates (node availability, job completion)
+9. API moves the job to the backup pool
+10. Backup pool autoscales up, task runs, pool scales back to 0
 
 ## Timing
 
 | Step | Latency |
 |------|---------|
-| Pool resize failure | Instant (quota rejection) |
+| Pool resize failure | Instant (quota rejection) or seconds (capacity) |
+| Autoscale evaluation | Every 5 min (generates fresh resize events) |
 | ServiceLog ingestion to Log Analytics | ~2-5 min |
 | Scheduled query evaluation | Every 5 min |
 | Webhook call + API failover | ~1-3 sec |
-| **Total end-to-end** | **~5-10 min** |
+| **Total end-to-end** | **~5-15 min** |
 
 ## Limitations
 
 - Does **not** guarantee capacity on the backup pool
 - Does **not** support checkpointing — interrupted tasks are requeued from scratch
 - Log-based alerts depend on ServiceLog ingestion latency (~2-5 min)
-- The `PoolResizeCompleteEvent` is only emitted on resize operations — a pool that's already failed won't generate new events without a new resize (e.g. from autoscale)
-- Azure Monitor webhook calls have aggressive timeouts; the API may return 499 on long failover operations (the failover still completes)
+- The `PoolResizeCompleteEvent` is only emitted on resize operations — with autoscale enabled, this happens every evaluation interval (5 min)
+- Azure Monitor webhook calls have aggressive timeouts; the API may return HTTP 499 on long operations (the failover still completes)
+- Jobs near completion (above `JOB_COMPLETION_THRESHOLD_PERCENT`) are intentionally left on the failing pool
