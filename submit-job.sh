@@ -13,10 +13,10 @@
 #   COMMAND="/bin/bash -c 'my-script.sh'" ./submit-job.sh  # custom task command
 #
 # Config (override via env vars):
-#   BATCH_ACCOUNT_NAME  — default: batchaccountameetk
+#   BATCH_ACCOUNT_NAME  — Batch account name (required)
 #   RESOURCE_GROUP      — default: batch
-#   PRIMARY_POOL        — the primary pool to submit to
-#   FALLBACK_POOL       — the backup pool (for verification only)
+#   PRIMARY_POOL        — the primary pool to submit to (required)
+#   FALLBACK_POOL       — the backup pool (required, for verification only)
 #   WEBHOOK_URL         — the Container App webhook endpoint (used in docs only)
 #   JOB_PREFIX          — job name prefix (default: batch-run)
 #   COMMAND             — task command (default: echo hello)
@@ -24,10 +24,10 @@
 set -euo pipefail
 
 MODE="${1:-submit}"
-BATCH_ACCOUNT_NAME="${BATCH_ACCOUNT_NAME:-batchaccountameetk}"
+BATCH_ACCOUNT_NAME="${BATCH_ACCOUNT_NAME:?Set BATCH_ACCOUNT_NAME}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-batch}"
-PRIMARY_POOL="${PRIMARY_POOL:-pool-hbv4-err-20260317T091514Z}"
-FALLBACK_POOL="${FALLBACK_POOL:-pool-ev3-swedencentral-20260317T091042Z}"
+PRIMARY_POOL="${PRIMARY_POOL:?Set PRIMARY_POOL}"
+FALLBACK_POOL="${FALLBACK_POOL:?Set FALLBACK_POOL}"
 JOB_PREFIX="${JOB_PREFIX:-batch-run}"
 COMMAND="${COMMAND:-/bin/bash -c 'echo hello from batch job'}"
 MAX_WAIT_MINUTES="${MAX_WAIT_MINUTES:-15}"

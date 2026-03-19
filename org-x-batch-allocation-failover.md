@@ -79,7 +79,7 @@ POOL_MAP="primary1:backup1:maxNodes,primary2:backup2:maxNodes,..."
 
 Example:
 ```
-POOL_MAP="pool-hbv4-err-20260317T091514Z:pool-ev3-swedencentral-20260317T091042Z:2"
+POOL_MAP="pool-hbv4:pool-ev3:2"
 ```
 
 - **Primary pools** (keys) — monitored for failures, jobs are moved FROM these
@@ -181,7 +181,7 @@ Sent by Azure Monitor metric alerts (e.g. `CreatingNodeCount > 0`). Contains `po
             "dimensions": [
               {
                 "name": "poolId",
-                "value": "pool-hbv4-err-20260317T091514Z"
+                "value": "<primary-pool-id>"
               }
             ]
           }
@@ -330,7 +330,7 @@ az batch job show --job-id <job-id> --query '{pool:poolInfo.poolId,state:state}'
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BATCH_ACCOUNT_NAME` | `batchaccountameetk` | Batch account name |
+| `BATCH_ACCOUNT_NAME` | required | Batch account name |
 | `RESOURCE_GROUP` | `batch` | Resource group |
 | `PRIMARY_POOL` | (configured) | Primary pool ID |
 | `FALLBACK_POOL` | (configured) | Backup pool ID |
