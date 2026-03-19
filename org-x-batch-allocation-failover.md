@@ -104,15 +104,17 @@ Both pools should have autoscale enabled:
 ```
 $samples = $PendingTasks.GetSamplePercent(TimeInterval_Minute * 5);
 $tasks = ($samples < 70) ? 0 : max($PendingTasks.GetSample(1));
-$targetDedicatedNodes = ($tasks > 0) ? 1 : 0;
+$TargetDedicatedNodes = ($tasks > 0) ? 1 : 0;
 ```
 
 **Backup pool** — scales up for tasks, back to 0 when idle (saves cost):
 ```
 $samples = $PendingTasks.GetSamplePercent(TimeInterval_Minute * 5);
 $tasks = ($samples < 70) ? max(0, $TargetDedicatedNodes) : max($PendingTasks.GetSample(1));
-$targetDedicatedNodes = ($tasks > 0) ? max(1, $tasks) : 0;
+$TargetDedicatedNodes = ($tasks > 0) ? max(1, $tasks) : 0;
 ```
+
+> **Important:** Use `$TargetDedicatedNodes` (uppercase T). The Batch autoscale engine ignores `$targetDedicatedNodes` (lowercase) — the formula will evaluate but the pool won't actually resize.
 
 ---
 
@@ -127,7 +129,9 @@ $targetDedicatedNodes = ($tasks > 0) ? max(1, $tasks) : 0;
 5. **Node availability gate** — if `currentNodes / maxNodes >= NODE_AVAILABILITY_THRESHOLD_PERCENT`, skip (pool has enough capacity)
 6. **Per-job evaluation**:
    - **Job completion gate** — if `completedTasks / totalTasks >= JOB_COMPLETION_THRESHOLD_PERCENT`, skip (let it finish)
-   - **Move job** — disable (requeue tasks) → update pool to backup → re-enable
+   - **Move job** — disable (requeue tasks) → wait for disabled state → update pool to backup → re-enable
+
+> **Note:** After disabling a job, the API waits up to 10 seconds for the job to fully transition to `disabled` state before updating the pool. This prevents a race condition where the pool update fails with "job is not in disabled state".
 
 ### Two alert types handled
 
@@ -317,7 +321,22 @@ az batch pool autoscale enable --pool-id <backup-pool> \
 
 # Custom task command
 COMMAND="/bin/bash -c 'my-script.sh'" ./submit-job.sh --wait
+
+# Check job status
+az batch job show --job-id <job-id> --query '{pool:poolInfo.poolId,state:state}' -o json
 ```
+
+`submit-job.sh` configuration (override via env vars):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BATCH_ACCOUNT_NAME` | `batchaccountameetk` | Batch account name |
+| `RESOURCE_GROUP` | `batch` | Resource group |
+| `PRIMARY_POOL` | (configured) | Primary pool ID |
+| `FALLBACK_POOL` | (configured) | Backup pool ID |
+| `JOB_PREFIX` | `batch-run` | Job name prefix |
+| `COMMAND` | `echo hello` | Task command to run |
+| `MAX_WAIT_MINUTES` | `15` | Max wait time in `--wait` mode |
 
 ### What happens
 1. Job is submitted to the primary pool
@@ -348,5 +367,15 @@ COMMAND="/bin/bash -c 'my-script.sh'" ./submit-job.sh --wait
 - Does **not** support checkpointing — interrupted tasks are requeued from scratch
 - Log-based alerts depend on ServiceLog ingestion latency (~2-5 min)
 - The `PoolResizeCompleteEvent` is only emitted on resize operations — with autoscale enabled, this happens every evaluation interval (5 min)
-- Azure Monitor webhook calls have aggressive timeouts; the API may return HTTP 499 on long operations (the failover still completes)
+- Azure Monitor webhook calls have aggressive timeouts; the API may return HTTP 499 on long operations (the failover still completes on the second retry)
 - Jobs near completion (above `JOB_COMPLETION_THRESHOLD_PERCENT`) are intentionally left on the failing pool
+- Autoscale formula variables are **case-sensitive** — must use `$TargetDedicatedNodes` (uppercase T)
+
+## Known Issues and Fixes
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| Autoscale evaluates but pool doesn't resize | Formula uses `$targetDedicatedNodes` (lowercase) | Use `$TargetDedicatedNodes` (uppercase T) |
+| Job left in `disabled` state after failover | Race condition — pool update attempted before job fully transitions to disabled | API now waits up to 10s for disabled state before updating pool |
+| Alert fires but returns HTTP 499 | Azure Monitor webhook timeout (<5s) | Failover still completes; Azure Monitor retries the call |
+| No `PoolResizeCompleteEvent` after job submit | Fixed-size pool with existing errors doesn't generate new events | Enable autoscale — it re-evaluates every 5 min, generating fresh events |
